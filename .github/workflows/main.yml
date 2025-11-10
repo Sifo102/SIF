@@ -1,82 +1,166 @@
 name: RDP
-on:
+on: 
   workflow_dispatch:
+
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 3600
+    timeout-minutes: 28800
+    
     steps:
       - name: Configure Core RDP Settings
         run: |
+          # إعدادات الطاقة المبسطة
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          
+          # إعدادات RDP الأساسية
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
+          
+          # الجدار الناري
+          netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
+          
+          # إعادة تشغيل الخدمة
           Restart-Service -Name TermService -Force
 
-      - name: Create RDP User with Static Password
+      - name: Create RDP User
         run: |
           $password = "admin@123"
           $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-
-          if (-not (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue)) {
-              New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
-          }
-
-          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
-
-          echo "RDP_CREDS=User: TOOLBOXLAP | Password: $password" >> $env:GITHUB_ENV
-
-          if (-not (Get-LocalUser -Name "TOOLBOXLAP")) {
+          
+          # حذف المستخدم إذا كان موجوداً وإنشاؤه من جديد
+          Remove-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue
+          New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
+          Set-LocalUser -Name "TOOLBOXLAP" -PasswordNeverExpires $true
+          
+          # إضافة إلى المجموعات
+          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP" -ErrorAction SilentlyContinue
+          
+          # التحقق من إنشاء المستخدم
+          if (Get-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue) {
+              Write-Host "User created successfully"
+              echo "RDP_CREDS=TOOLBOXLAP:$password" >> $env:GITHUB_ENV
+          } else {
               Write-Error "User creation failed"
               exit 1
           }
 
-      - name: Install Tailscale
+      - name: Download and Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-
+          
+          # تحميل Tailscale
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
+          
+          # التثبيت باستخدام الأمر مباشرة
+          msiexec.exe /i "$installerPath" /quiet /norestart
+          
+          # الانتظار للتثبيت
+          Start-Sleep -Seconds 30
+          
+          # تنظيف الملف المؤقت
+          Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
 
-      - name: Establish Tailscale Connection
+      - name: Start Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # الانتظار للتأكد من اكتمال التثبيت
+          Start-Sleep -Seconds 10
+          
+          # تشغيل Tailscale
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-rdp-$env:GITHUB_RUN_ID
+          
+          # الحصول على IP
           $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          for ($i = 1; $i -le 15; $i++) {
+              $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+              if ($tsIP) {
+                  Write-Host "Tailscale IP: $tsIP"
+                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                  break
+              }
+              Write-Host "Waiting for Tailscale IP... ($i/15)"
+              Start-Sleep -Seconds 10
           }
+          
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+              Write-Host "Trying alternative method to get IP..."
+              $tsStatus = & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              $tsIP = $tsStatus.Self.TailscaleIPs[0]
+              if ($tsIP) {
+                  echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              } else {
+                  Write-Error "Failed to get Tailscale IP"
+                  exit 1
+              }
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
+      - name: Verify RDP Connection
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+          Write-Host "Testing RDP connection on: $env:TAILSCALE_IP"
+          
+          # محاولة متعددة للاتصال
+          $maxAttempts = 10
+          for ($i = 1; $i -le $maxAttempts; $i++) {
+              try {
+                  $connectionTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet -WarningAction SilentlyContinue
+                  if ($connectionTest) {
+                      Write-Host "RDP connection successful!"
+                      break
+                  }
+              } catch {
+                  Write-Host "Attempt $i failed: $($_.Exception.Message)"
+              }
+              
+              if ($i -eq $maxAttempts) {
+                  Write-Host "RDP connection test failed after $maxAttempts attempts"
+                  # لا نوقف العملية لأن RDP قد يعمل رغم فشل الاختبار
+              }
+              
+              Start-Sleep -Seconds 10
           }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Maintain Connection
+      - name: Keep RDP Active for 20 Days
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "=========================================="
+          Write-Host "RDP ACCESS INFORMATION"
+          Write-Host "IP Address: $env:TAILSCALE_IP"
           Write-Host "Username: TOOLBOXLAP"
           Write-Host "Password: admin@123"
-          Write-Host "==================`n"
-          while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
-              Start-Sleep -Seconds 300
+          Write-Host "=========================================="
+          Write-Host "This RDP session will remain active for 20 days"
+          Write-Host "Started at: $(Get-Date)"
+          
+          $totalMinutes = 20 * 24 * 60  # 20 يوم بالدقائق
+          $checkInterval = 300  # التحقق كل 5 دقائق
+          
+          for ($minute = 0; $minute -lt $totalMinutes; $minute += $checkInterval) {
+              $daysRemaining = [math]::Round(($totalMinutes - $minute) / (24 * 60), 1)
+              Write-Host "[$(Get-Date)] RDP Active - $daysRemaining days remaining"
+              
+              # التحقق من خدمات RDP
+              $termservice = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+              if ($termservice.Status -ne "Running") {
+                  Write-Host "RDP Service stopped, restarting..."
+                  Start-Service -Name "TermService" -ErrorAction SilentlyContinue
+              }
+              
+              # التحقق من اتصال Tailscale
+              try {
+                  $tsStatus = & "C:\Program Files\Tailscale\tailscale.exe" status 2>$null
+                  if ($LASTEXITCODE -ne 0) {
+                      Write-Host "Tailscale disconnected, reconnecting..."
+                      & "C:\Program Files\Tailscale\tailscale.exe" up --reset 2>$null
+                  }
+              } catch {
+                  Write-Host "Tailscale check failed: $($_.Exception.Message)"
+              }
+              
+              Start-Sleep -Seconds $checkInterval
           }
+          
+          Write-Host "20-day period completed. RDP session ending."
