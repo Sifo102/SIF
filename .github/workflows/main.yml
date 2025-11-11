@@ -1,188 +1,196 @@
-name: RDP 20 Days
+name: RDP
 on:
   workflow_dispatch:
 
 jobs:
-  setup-rdp:
+  build:
     runs-on: windows-latest
-    timeout-minutes: 60
+    timeout-minutes: 28800
+    
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure RDP Settings
         run: |
+          # Enable RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxConnectionTime" -Value 0xFFFFFFFF -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxDisconnectionTime" -Value 0xFFFFFFFF -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 0xFFFFFFFF -Force
+          # Prevent RDP session timeout
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxConnectionTime" -Value 2147483647 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxDisconnectionTime" -Value 2147483647 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 2147483647 -Force
           
+          # Firewall rule
           netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
-          Restart-Service -Name TermService -Force
-
-      - name: Disable Sleep and Power Saving
-        run: |
-          powercfg -change -standby-timeout-ac 0
-          powercfg -change -hibernate-timeout-ac 0
-          powercfg -change -monitor-timeout-ac 0
-          powercfg -change -disk-timeout-ac 0
           
-          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          # Restart service
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP configured successfully"
 
-      - name: Create RDP User
+      - name: Disable Power Saving
         run: |
+          # Disable all power saving features
+          powercfg /change standby-timeout-ac 0
+          powercfg /change hibernate-timeout-ac 0
+          powercfg /change monitor-timeout-ac 0
+          powercfg /change disk-timeout-ac 0
+          
+          # Set high performance power plan
+          powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
+          Write-Host "Power saving disabled"
+
+      - name: Create User Account
+        run: |
+          $username = "TOOLBOXLAP"
           $password = "admin@123"
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
-          Remove-LocalUser -Name "TOOLBOXLAP" -ErrorAction SilentlyContinue
-          New-LocalUser -Name "TOOLBOXLAP" -Password $securePass -AccountNeverExpires
-          Add-LocalGroupMember -Group "Administrators" -Member "TOOLBOXLAP"
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "TOOLBOXLAP"
-          Set-LocalUser -Name "TOOLBOXLAP" -PasswordNeverExpires $true
-          echo "RDP_CREDS=TOOLBOXLAP:$password" >> $env:GITHUB_ENV
+          
+          # Delete user if exists and create new
+          Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires
+          
+          # Add to groups
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          
+          # Set password never expires
+          Set-LocalUser -Name $username -PasswordNeverExpires $true
+          
+          Write-Host "User $username created successfully"
+          echo "RDP_USER=$username" >> $env:GITHUB_ENV
+          echo "RDP_PASS=$password" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
+          
+          # Download and install
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Start-Process msiexec.exe -Wait -ArgumentList @(
+            "/i",
+            "`"$installerPath`"",
+            "/quiet",
+            "/norestart"
+          )
           Remove-Item $installerPath -Force
-          Start-Sleep -Seconds 10
+          
+          # Wait for installation
+          Start-Sleep -Seconds 15
+          Write-Host "Tailscale installed successfully"
 
-      - name: Start Tailscale with Persistent Settings
+      - name: Setup Tailscale Connection
         run: |
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=rdp-20days --accept-routes --accept-dns --reset
+          # Start Tailscale
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=github-rdp --accept-routes --accept-dns --reset
           
-          # استخدام tagged nodes لمنع المصادقة المتكررة
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" set --tag=rdp-persistent
-          
+          # Get IP address
+          $maxRetries = 30
+          $retryCount = 0
           $tsIP = $null
-          for ($i = 1; $i -le 30; $i++) {
+          
+          while ($retryCount -lt $maxRetries -and -not $tsIP) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if ($tsIP) { break }
-              Start-Sleep -Seconds 5
+              if (-not $tsIP) {
+                  $retryCount++
+                  Start-Sleep -Seconds 5
+              }
           }
           
           if (-not $tsIP) {
-              # محاولة بديلة للحصول على IP
-              $tsStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-              $tsIP = $tsStatus.Self.TailscaleIPs[0]
+              Write-Host "Trying alternative method to get IP..."
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              $tsIP = $status.Self.TailscaleIPs | Where-Object { $_ -like "100.*" } | Select-Object -First 1
           }
           
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-          Write-Host "Tailscale IP: $tsIP"
+          if ($tsIP) {
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              Write-Host "Tailscale IP: $tsIP"
+          } else {
+              Write-Error "Failed to get Tailscale IP after $maxRetries attempts"
+              exit 1
+          }
 
       - name: Disable Windows Updates
         run: |
-          Stop-Service -Name "wuauserv" -Force
-          Set-Service -Name "wuauserv" -StartupType Disabled
-          Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -Force
+          # Disable Windows Update service
+          Stop-Service -Name "wuauserv" -Force -ErrorAction SilentlyContinue
+          Set-Service -Name "wuauserv" -StartupType Disabled -ErrorAction SilentlyContinue
+          
+          # Disable automatic updates via registry
+          New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
+          Write-Host "Windows updates disabled"
 
-      - name: Create Persistent Service
+      - name: Test RDP Connection
         run: |
-          # إنشاء سكريبت خدمة للحفاظ على RDP
-          $serviceScript = @"
-          `$startTime = Get-Date
-          `$endTime = `$startTime.AddDays(20)
-          `$checkCount = 0
-          
-          while ((Get-Date) -lt `$endTime) {
-              `$remaining = `$endTime - (Get-Date)
-              `$days = [math]::Round(`$remaining.TotalDays, 1)
-              
-              # تسجيل الحالة كل ساعة
-              if (`$checkCount % 12 -eq 0) {
-                  Add-Content -Path "C:\rdp-status.log" -Value "[`$(Get-Date)] RDP Active - `$days days remaining"
-              }
-              
-              # التحقق من خدمات RDP
-              `$termservice = Get-Service -Name 'TermService' -ErrorAction SilentlyContinue
-              if (`$termservice.Status -ne 'Running') {
-                  Start-Service -Name 'TermService' -Force
-                  Add-Content -Path "C:\rdp-status.log" -Value "[`$(Get-Date)] Restarted TermService"
-              }
-              
-              # التحقق من Tailscale كل 30 دقيقة
-              if (`$checkCount % 6 -eq 0) {
-                  try {
-                      `$tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-                      if (-not `$tsIP) {
-                          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
-                          Add-Content -Path "C:\rdp-status.log" -Value "[`$(Get-Date)] Restarted Tailscale"
-                      }
-                  } catch {
-                      Add-Content -Path "C:\rdp-status.log" -Value "[`$(Get-Date)] Tailscale Error: `$_"
-                  }
-              }
-              
-              `$checkCount++
-              Start-Sleep -Seconds 300
+          Write-Host "Testing RDP connection to $env:TAILSCALE_IP"
+          $connectionTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+          if ($connectionTest) {
+              Write-Host "RDP connection test: SUCCESS"
+          } else {
+              Write-Host "RDP connection test: FAILED - but continuing anyway"
           }
-          Add-Content -Path "C:\rdp-status.log" -Value "[`$(Get-Date)] 20-day period completed"
-"@
-          
-          Set-Content -Path "C:\keep-rdp-alive.ps1" -Value $serviceScript
-          
-          # إنشاء مهمة مجدولة لتشغيل السكريبت
-          $action = New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-WindowStyle Hidden -File C:\keep-rdp-alive.ps1"
-          $trigger = New-ScheduledTaskTrigger -AtStartup
-          $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -RunOnlyIfNetworkAvailable:$false
-          Register-ScheduledTask -TaskName "KeepRDPAlive" -Action $action -Trigger $trigger -Settings $settings -RunLevel Highest -Force
 
-      - name: Start Persistent Service and Show Info
+      - name: Keep Alive for 20 Days
         run: |
-          # بدء الخدمة
-          Start-ScheduledTask -TaskName "KeepRDPAlive"
-          
-          # الانتظار قليلاً ثم الحصول على IP النهائي
-          Start-Sleep -Seconds 10
-          $finalIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-          if (-not $finalIP) {
-              $finalIP = $env:TAILSCALE_IP
-          }
-          
-          Write-Host "=========================================="
-          Write-Host "=== RDP 20 DAYS - READY ==="
-          Write-Host "IP Address: $finalIP"
-          Write-Host "Username: TOOLBOXLAP"
-          Write-Host "Password: admin@123"
-          Write-Host "=========================================="
-          Write-Host "System will remain active for 20 days"
+          Write-Host ""
+          Write-Host "=================================================="
+          Write-Host "🎯 RDP ACCESS INFORMATION"
+          Write-Host "=================================================="
+          Write-Host "IP Address: $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USER"
+          Write-Host "Password: $env:RDP_PASS"
+          Write-Host ""
+          Write-Host "⏰ Session Duration: 20 DAYS"
           Write-Host "Start Time: $(Get-Date)"
           Write-Host "End Time: $((Get-Date).AddDays(20))"
-          Write-Host "=========================================="
-          
-          # تشغيل السكريبت مباشرة أيضاً
-          Start-Process PowerShell.exe -ArgumentList "-WindowStyle Hidden -File C:\keep-rdp-alive.ps1" -WindowStyle Hidden
+          Write-Host "=================================================="
+          Write-Host ""
 
-  monitor-rdp:
-    runs-on: windows-latest
-    needs: setup-rdp
-    timeout-minutes: 28800  # 20 يوم
-    steps:
-      - name: Wait and Monitor
-        run: |
-          $startTime = Get-Date
-          $endTime = $startTime.AddDays(20)
+          $totalSeconds = 20 * 24 * 60 * 60  # 20 days in seconds
+          $checkInterval = 300  # Check every 5 minutes
+          $totalChecks = $totalSeconds / $checkInterval
+          $checkCount = 0
           
-          while ((Get-Date) -lt $endTime) {
-              $remaining = $endTime - (Get-Date)
-              $days = [math]::Round($remaining.TotalDays, 1)
-              $hours = [math]::Round($remaining.TotalHours, 1)
+          for ($i = 0; $i -lt $totalChecks; $i++) {
+              $currentTime = Get-Date
+              $elapsed = $currentTime - (Get-Date).AddDays(-20).AddSeconds($totalSeconds)
+              $remainingDays = 20 - [math]::Round($elapsed.TotalDays, 1)
               
-              Write-Host "[$(Get-Date)] RDP Session Active - $days days ($hours hours) remaining"
-              
-              # التحقق من السجلات إذا كانت متاحة
-              try {
-                  if (Test-Path "C:\rdp-status.log") {
-                      $lastLog = Get-Content "C:\rdp-status.log" -Tail 1
-                      Write-Host "Last service log: $lastLog"
-                  }
-              } catch {
-                  # تجاهل أخطاء القراءة
+              # Display status every hour
+              if ($checkCount % 12 -eq 0) {
+                  Write-Host "[$(Get-Date)] RDP Active - $remainingDays days remaining"
               }
               
-              Start-Sleep -Seconds 300  # 5 دقائق
+              # Health check every 30 minutes
+              if ($checkCount % 6 -eq 0) {
+                  # Check RDP service
+                  $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+                  if ($rdpService.Status -ne "Running") {
+                      Write-Host "RDP service not running - restarting..."
+                      Start-Service -Name "TermService" -Force
+                  }
+                  
+                  # Check Tailscale connection
+                  try {
+                      $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                      if (-not $currentIP) {
+                          Write-Host "Tailscale disconnected - reconnecting..."
+                          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
+                      }
+                  } catch {
+                      Write-Host "Tailscale check failed: $($_.Exception.Message)"
+                  }
+              }
+              
+              # Refresh Tailscale every 4 hours to prevent auth issues
+              if ($checkCount % 48 -eq 0) {
+                  Write-Host "Refreshing Tailscale connection..."
+                  & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --reset
+              }
+              
+              $checkCount++
+              Start-Sleep -Seconds $checkInterval
           }
           
-          Write-Host "20-day RDP session completed successfully at $(Get-Date)"
+          Write-Host "20-day RDP session completed successfully!"
