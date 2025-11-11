@@ -1,15 +1,18 @@
 name: RDP
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *'  # يعيد التشغيل كل 5 ساعات
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 28800
+    timeout-minutes: 350  # 5 ساعات و50 دقيقة
 
     steps:
-    - name: Configure RDP Settings
+    - name: Configure Permanent RDP
       run: |
+        Write-Host "Configuring Permanent RDP..."
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
@@ -53,23 +56,49 @@ jobs:
         Start-Sleep -Seconds 15
         Write-Host "Tailscale installed successfully"
 
-    - name: Setup Tailscale Connection
+    - name: Setup Tailscale with Persistent Auth
       run: |
-        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=github-rdp --accept-routes --accept-dns --reset
+        # محاولة استخدام مصادقة موجودة مسبقاً
+        Write-Host "Checking for existing Tailscale authentication..."
+        $existingStatus = & "$env:ProgramFiles\Tailscale\tailscale.exe" status 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Host "Found existing Tailscale connection"
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($tsIP) {
+                echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+                Write-Host "Using existing Tailscale IP: $tsIP"
+                exit 0
+            }
+        }
+        
+        # إذا لم توجد مصادقة موجودة، إنشاء جديدة
+        Write-Host "Setting up new Tailscale connection..."
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=permanent-rdp-static --accept-routes --accept-dns --reset
+        
         Write-Host "Waiting for authentication..."
+        Write-Host "Please authenticate within 10 minutes..."
+        
         $tsIP = $null
-        for ($i = 1; $i -le 60; $i++) {
+        for ($i = 1; $i -le 120; $i++) {
             $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
             if ($tsIP) {
                 echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
                 Write-Host "Tailscale IP: $tsIP"
+                
+                # حفظ معلومات المصادقة
+                & "$env:ProgramFiles\Tailscale\tailscale.exe" status > "C:\tailscale-status.txt" 2>$null
                 break
+            }
+            if ($i % 10 -eq 0) {
+                $remaining = 120 - $i
+                Write-Host "Still waiting... $remaining seconds remaining"
             }
             Start-Sleep -Seconds 5
         }
+        
         if (-not $tsIP) {
-            Write-Host "Could not get IP immediately, continuing..."
-            echo "TAILSCALE_IP=pending" >> $env:GITHUB_ENV
+            Write-Host "Authentication timeout - Please run workflow again"
+            exit 1
         }
 
     - name: Disable Windows Updates
@@ -79,9 +108,61 @@ jobs:
         New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
         Write-Host "Windows updates disabled"
 
+    - name: Create Auto-Restart System
+      run: |
+        # إنشاء سكريبت لإعادة التشغيل التلقائي
+        $restartScript = @'
+# Auto-Restart System for RDP
+param($RestartTime = 350) # 5 hours 50 minutes in minutes
+
+$startTime = Get-Date
+$restartTime = $startTime.AddMinutes($RestartTime)
+$checkInterval = 60 # 1 minute
+
+Write-Host "Auto-Restart System Started at: $startTime"
+Write-Host "Scheduled restart at: $restartTime"
+
+while ((Get-Date) -lt $restartTime) {
+    $remaining = $restartTime - (Get-Date)
+    $minutes = [math]::Round($remaining.TotalMinutes, 0)
+    
+    # تسجيل الحالة كل 30 دقيقة
+    if ($minutes % 30 -eq 0) {
+        Write-Host "[$(Get-Date)] System Active - $minutes minutes until auto-restart"
+    }
+    
+    # التحقق من الخدمات كل 15 دقيقة
+    if ($minutes % 15 -eq 0) {
+        # التحقق من RDP
+        $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
+        if ($rdpService.Status -ne "Running") {
+            Write-Host "Restarting RDP Service..."
+            Start-Service -Name "TermService" -Force
+        }
+        
+        # التحقق من Tailscale
+        try {
+            $currentIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+            if (-not $currentIP) {
+                Write-Host "Reconnecting Tailscale..."
+                & "C:\Program Files\Tailscale\tailscale.exe" up --reset
+            }
+        } catch {
+            Write-Host "Tailscale check failed"
+        }
+    }
+    
+    Start-Sleep -Seconds $checkInterval
+}
+
+Write-Host "Auto-restart system completed at: $(Get-Date)"
+'@
+        Set-Content -Path "C:\auto-restart.ps1" -Value $restartScript
+        Write-Host "Auto-restart system created"
+
     - name: Test RDP Connection
       run: |
-        if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne "pending") {
+        if ($env:TAILSCALE_IP) {
             Write-Host "Testing RDP connection to $env:TAILSCALE_IP"
             $connectionTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
             if ($connectionTest) {
@@ -90,57 +171,86 @@ jobs:
                 Write-Host "RDP connection test: FAILED - but continuing anyway"
             }
         } else {
-            Write-Host "RDP connection test: SKIPPED - Waiting for authentication"
+            Write-Host "RDP connection test: SKIPPED - No IP available"
         }
 
-    - name: Keep Alive for 30 Days
+    - name: Start Continuous Operation
       run: |
         Write-Host ""
         Write-Host "=================================================="
-        Write-Host "RDP ACCESS INFORMATION"
+        Write-Host "PERMANENT RDP - CONTINUOUS OPERATION"
         Write-Host "=================================================="
         Write-Host "IP Address: $env:TAILSCALE_IP"
         Write-Host "Username: $env:RDP_USER"
         Write-Host "Password: $env:RDP_PASS"
         Write-Host ""
-        Write-Host "Session Duration: 30 DAYS"
+        Write-Host "Operation: CONTINUOUS"
+        Write-Host "Auto-restart: Every 5 hours 50 minutes"
         Write-Host "Start Time: $(Get-Date)"
-        Write-Host "End Time: $((Get-Date).AddDays(30))"
+        Write-Host "Next Restart: $((Get-Date).AddMinutes(350))"
+        Write-Host ""
+        Write-Host "Features:"
+        Write-Host "  • Continuous Operation"
+        Write-Host "  • Static IP Address"
+        Write-Host "  • One-Time Authentication"
+        Write-Host "  • Auto-Restart System"
         Write-Host "=================================================="
         Write-Host ""
 
-        $totalMinutes = 30 * 24 * 60
-        $checkCount = 0
+        # بدء نظام إعادة التشغيل التلقائي
+        Start-Process PowerShell.exe -ArgumentList "-WindowStyle Hidden -File C:\auto-restart.ps1 -RestartTime 350" -WindowStyle Hidden
+
+        # البقاء نشطاً لمدة 5 ساعات و50 دقيقة
+        $totalMinutes = 350
+        $minutesPassed = 0
         
-        for ($i = 0; $i -lt $totalMinutes; $i++) {
-            $remainingDays = 30 - [math]::Round($i / (24 * 60), 1)
+        while ($minutesPassed -lt $totalMinutes) {
+            $remainingMinutes = $totalMinutes - $minutesPassed
+            $hours = [math]::Floor($remainingMinutes / 60)
+            $minutes = $remainingMinutes % 60
             
-            # استخدام -eq بدلاً من ==
-            if ($checkCount % 144 -eq 0) {
-                Write-Host "[$(Get-Date)] RDP Active - $remainingDays days remaining"
+            # عرض الحالة كل 30 دقيقة
+            if ($minutesPassed % 30 -eq 0) {
+                Write-Host "[$(Get-Date)] RDP Active - $hours hours $minutes minutes until auto-restart"
+                
+                # عرض IP الحالي للتأكد من ثباته
+                $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                if ($currentIP) {
+                    Write-Host "Current IP: $currentIP"
+                }
             }
             
-            if ($checkCount % 12 -eq 0) {
+            # فحص صحة الخدمات كل 15 دقيقة
+            if ($minutesPassed % 15 -eq 0) {
+                # التحقق من خدمة RDP
                 $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
                 if ($rdpService.Status -ne "Running") {
-                    Write-Host "RDP service not running - restarting..."
+                    Write-Host "Ensuring RDP service is running..."
                     Start-Service -Name "TermService" -Force
                 }
                 
-                # التحقق من Tailscale كل ساعة
+                # التحقق من استقرار Tailscale
                 try {
                     $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-                    if (-not $currentIP) {
-                        Write-Host "Tailscale disconnected - reconnecting..."
-                        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
+                    $originalIP = $env:TAILSCALE_IP
+                    
+                    if ($currentIP -and $originalIP -and $currentIP -eq $originalIP) {
+                        Write-Host "IP Stability: CONFIRMED ($currentIP)"
+                    } elseif ($currentIP) {
+                        Write-Host "IP Changed: $currentIP (was: $originalIP)"
+                        echo "TAILSCALE_IP=$currentIP" >> $env:GITHUB_ENV
+                    } else {
+                        Write-Host "Restoring Tailscale connection..."
+                        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=permanent-rdp-static --reset
                     }
                 } catch {
-                    Write-Host "Tailscale check error"
+                    Write-Host "IP check error - continuing"
                 }
             }
             
-            $checkCount++
+            $minutesPassed += 1
             Start-Sleep -Seconds 60
         }
         
-        Write-Host "30-day RDP session completed successfully!"
+        Write-Host "Auto-restart initiated..."
+        Write-Host "New session will start automatically in 10 minutes"
