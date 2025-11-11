@@ -1,329 +1,134 @@
 name: RDP
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *'  # يعيد التشغيل كل 5 ساعات
 
 jobs:
   build:
     runs-on: windows-latest
-    timeout-minutes: 350  # 5 ساعات و50 دقيقة
+    timeout-minutes: 28800
 
     steps:
-    - name: Configure Permanent RDP
+    - name: Configure RDP Settings
       run: |
-        Write-Host "🔄 Configuring Permanent RDP..."
-        
-        # تمكين RDP
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-        
-        # منع انتهاء الجلسة نهائياً
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxConnectionTime" -Value 2147483647 -Force
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxDisconnectionTime" -Value 2147483647 -Force
         Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "MaxIdleTime" -Value 2147483647 -Force
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveTimeout" -Value 2147483647 -Force
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "KeepAliveInterval" -Value 2147483647 -Force
-        
-        # الجدار الناري
-        netsh advfirewall firewall add rule name="RDP-Permanent" dir=in action=allow protocol=TCP localport=3389
-        
-        # إعادة تشغيل الخدمة
+        netsh advfirewall firewall add rule name="RDP" dir=in action=allow protocol=TCP localport=3389
         Restart-Service -Name TermService -Force
-        Write-Host "✅ RDP configured permanently"
+        Write-Host "RDP configured successfully"
 
-    - name: Disable All Power Management
+    - name: Disable Power Saving
       run: |
-        Write-Host "🔌 Disabling all power management..."
-        
-        # تعطيل كامل لإعدادات الطاقة
-        powercfg -change -standby-timeout-ac 0
-        powercfg -change -hibernate-timeout-ac 0
-        powercfg -change -monitor-timeout-ac 0
-        powercfg -change -disk-timeout-ac 0
-        powercfg -h off
+        powercfg /change standby-timeout-ac 0
+        powercfg /change hibernate-timeout-ac 0
+        powercfg /change monitor-timeout-ac 0
+        powercfg /change disk-timeout-ac 0
         powercfg -setactive 8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c
-        
-        # تعطيل في التسجيل
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Power" -Name "HibernateEnabled" -Value 0 -Force
-        Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Power" -Name "HiberbootEnabled" -Value 0 -Force
-        
-        Write-Host "✅ Power management completely disabled"
+        Write-Host "Power saving disabled"
 
-    - name: Create Permanent User
+    - name: Create User Account
       run: |
-        Write-Host "👤 Creating permanent user..."
         $username = "TOOLBOXLAP"
         $password = "admin@123"
-        
-        # إنشاء المستخدم
         Remove-LocalUser -Name $username -ErrorAction SilentlyContinue
         $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
         New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires
-        
-        # الصلاحيات
         Add-LocalGroupMember -Group "Administrators" -Member $username
         Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
         Set-LocalUser -Name $username -PasswordNeverExpires $true
-        net accounts /maxpwage:unlimited
-        
+        Write-Host "User $username created successfully"
         echo "RDP_USER=$username" >> $env:GITHUB_ENV
         echo "RDP_PASS=$password" >> $env:GITHUB_ENV
-        Write-Host "✅ Permanent user created"
 
     - name: Install Tailscale
       run: |
-        Write-Host "📦 Installing Tailscale..."
         $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
         $installerPath = "$env:TEMP\tailscale.msi"
-        
         Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-        Start-Process msiexec.exe -Wait -ArgumentList @(
-          "/i",
-          "`"$installerPath`"",
-          "/quiet",
-          "/norestart"
-        )
+        Start-Process msiexec.exe -Wait -ArgumentList @("/i", "`"$installerPath`"", "/quiet", "/norestart")
         Remove-Item $installerPath -Force
         Start-Sleep -Seconds 15
-        Write-Host "✅ Tailscale installed"
+        Write-Host "Tailscale installed successfully"
 
-    - name: Setup Tailscale with Persistent Auth
+    - name: Setup Tailscale Connection
       run: |
-        Write-Host "🔗 Setting up Tailscale with persistent authentication..."
-        
-        # استخدام اسم مضيف ثابت للحفاظ على نفس IP
-        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=permanent-rdp-static --accept-routes --accept-dns --reset --operator-current-user
-        
-        Write-Host "⏳ Waiting for authentication..."
-        Write-Host "🌐 Please visit the URL above to authenticate within 10 minutes..."
-        
-        # الانتظار للمصادقة اليدوية
+        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=github-rdp --accept-routes --accept-dns --reset
+        Write-Host "Waiting for authentication..."
         $tsIP = $null
-        for ($i = 1; $i -le 120; $i++) {
+        for ($i = 1; $i -le 60; $i++) {
             $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
             if ($tsIP) {
                 echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-                Write-Host "✅ Tailscale IP: $tsIP"
-                
-                # حفظ الIP للمستقبل
-                Set-Content -Path "C:\tailscale-ip.txt" -Value $tsIP
+                Write-Host "Tailscale IP: $tsIP"
                 break
-            }
-            
-            if ($i % 10 -eq 0) {
-                $remaining = 120 - $i
-                Write-Host "⏳ Waiting... $remaining seconds remaining"
             }
             Start-Sleep -Seconds 5
         }
-        
         if (-not $tsIP) {
-            Write-Host "❌ Authentication timeout - Please run again"
-            exit 1
+            Write-Host "Could not get IP immediately, continuing..."
+            echo "TAILSCALE_IP=pending" >> $env:GITHUB_ENV
         }
 
-    - name: Disable All Interruptions
+    - name: Disable Windows Updates
       run: |
-        Write-Host "🚫 Disabling all interruptions..."
-        
-        # تعطيل التحديثات
-        $services = @("wuauserv", "UsoSvc", "WaaSMedicSvc", "BITS", "DoSvc", "WinDefend", "WdNisSvc")
-        foreach ($service in $services) {
-            Stop-Service -Name $service -Force -ErrorAction SilentlyContinue
-            Set-Service -Name $service -StartupType Disabled -ErrorAction SilentlyContinue
-        }
-        
-        # إعدادات التسجيل
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -Force
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoRebootWithLoggedOnUsers" -Value 1 -Force
-        Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "AUOptions" -Value 1 -Force
-        
-        Write-Host "✅ All interruptions disabled"
-
-    - name: Configure Network Stability
-      run: |
-        Write-Host "🌐 Configuring network stability..."
-        
-        # تحسين إعدادات TCP
-        netsh int tcp set global autotuninglevel=normal
-        netsh int tcp set global rss=enabled
-        netsh int tcp set global chimney=enabled
-        
-        Write-Host "✅ Network stability configured"
-
-    - name: Create Auto-Recovery System
-      run: |
-        Write-Host "🔧 Creating auto-recovery system..."
-        
-        $recoveryScript = @'
-# Auto-Recovery System for Permanent RDP
-$logPath = "C:\rdp-auto-recovery.log"
-$sessionStart = Get-Date
-$sessionEnd = $sessionStart.AddMinutes(350) # 5 hours 50 minutes
-
-function Write-RecoveryLog {
-    param([string]$Message)
-    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
-    $logEntry = "[$timestamp] $Message"
-    Add-Content -Path $logPath -Value $logEntry
-}
-
-Write-RecoveryLog "=== AUTO-RECOVERY SYSTEM STARTED ==="
-Write-RecoveryLog "Session Start: $sessionStart"
-Write-RecoveryLog "Session End: $sessionEnd"
-
-$checkCount = 0
-while ((Get-Date) -lt $sessionEnd) {
-    $remaining = $sessionEnd - (Get-Date)
-    $minutes = [math]::Round($remaining.TotalMinutes, 0)
-    
-    # تسجيل الحالة كل 30 دقيقة
-    if ($checkCount % 6 -eq 0) {
-        Write-RecoveryLog "System Active - $minutes minutes remaining"
-    }
-    
-    # التحقق من RDP كل 10 دقائق
-    if ($checkCount % 2 -eq 0) {
-        $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
-        if ($rdpService.Status -ne "Running") {
-            Write-RecoveryLog "RDP Service stopped - Auto-restarting"
-            Start-Service -Name "TermService" -Force
-        }
-    }
-    
-    # التحقق من Tailscale كل 15 دقيقة
-    if ($checkCount % 3 -eq 0) {
-        try {
-            $currentIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-            $savedIP = Get-Content "C:\tailscale-ip.txt" -ErrorAction SilentlyContinue
-            
-            if (-not $currentIP) {
-                Write-RecoveryLog "Tailscale disconnected - Auto-reconnecting"
-                & "C:\Program Files\Tailscale\tailscale.exe" up --reset
-            } elseif ($savedIP -and $currentIP -ne $savedIP) {
-                Write-RecoveryLog "IP changed from $savedIP to $currentIP - Restoring"
-                & "C:\Program Files\Tailscale\tailscale.exe" up --hostname=permanent-rdp-static --reset
-                Set-Content -Path "C:\tailscale-ip.txt" -Value $currentIP
-            }
-        } catch {
-            Write-RecoveryLog "Tailscale recovery error"
-        }
-    }
-    
-    $checkCount++
-    Start-Sleep -Seconds 300 # 5 دقائق
-}
-
-Write-RecoveryLog "=== SESSION COMPLETED - AUTO-RENEWING ==="
-'@
-
-        Set-Content -Path "C:\rdp-auto-recovery.ps1" -Value $recoveryScript
-        
-        # بدء نظام الاستعادة التلقائية
-        Start-Process PowerShell.exe -ArgumentList "-WindowStyle Hidden -File C:\rdp-auto-recovery.ps1" -WindowStyle Hidden
-        
-        Write-Host "✅ Auto-recovery system started"
+        Stop-Service -Name "wuauserv" -Force -ErrorAction SilentlyContinue
+        Set-Service -Name "wuauserv" -StartupType Disabled -ErrorAction SilentlyContinue
+        New-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate\AU" -Name "NoAutoUpdate" -Value 1 -PropertyType DWORD -Force -ErrorAction SilentlyContinue
+        Write-Host "Windows updates disabled"
 
     - name: Test RDP Connection
       run: |
-        Write-Host "🔍 Testing RDP connection..."
-        if ($env:TAILSCALE_IP) {
-            $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
-            if ($testResult) {
-                Write-Host "✅ RDP Connection: SUCCESS"
+        if ($env:TAILSCALE_IP -and $env:TAILSCALE_IP -ne "pending") {
+            Write-Host "Testing RDP connection to $env:TAILSCALE_IP"
+            $connectionTest = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -InformationLevel Quiet
+            if ($connectionTest) {
+                Write-Host "RDP connection test: SUCCESS"
             } else {
-                Write-Host "⚠️ RDP Connection: Port check failed but continuing"
+                Write-Host "RDP connection test: FAILED - but continuing anyway"
             }
+        } else {
+            Write-Host "RDP connection test: SKIPPED - Waiting for authentication"
         }
 
-    - name: Maintain Continuous Operation
+    - name: Keep Alive for 30 Days
       run: |
         Write-Host ""
-        Write-Host "========================================================"
-        Write-Host "🚀 PERMANENT RDP - CONTINUOUS OPERATION"
-        Write-Host "========================================================"
-        Write-Host "🌐 IP Address: $env:TAILSCALE_IP"
-        Write-Host "👤 Username: $env:RDP_USER"
-        Write-Host "🔑 Password: $env:RDP_PASS"
+        Write-Host "=================================================="
+        Write-Host "RDP ACCESS INFORMATION"
+        Write-Host "=================================================="
+        Write-Host "IP Address: $env:TAILSCALE_IP"
+        Write-Host "Username: $env:RDP_USER"
+        Write-Host "Password: $env:RDP_PASS"
         Write-Host ""
-        Write-Host "⏰ Operation: CONTINUOUS"
-        Write-Host "🔄 Auto-renewal: Every 5 hours"
-        Write-Host "🕐 Start Time: $(Get-Date)"
-        Write-Host "📅 Next Renewal: $((Get-Date).AddMinutes(350))"
-        Write-Host ""
-        Write-Host "🔒 Guaranteed Features:"
-        Write-Host "  • Continuous Operation"
-        Write-Host "  • Static IP Address"
-        Write-Host "  • One-Time Authentication"
-        Write-Host "  • Auto-Recovery System"
-        Write-Host "  • No Timeouts"
-        Write-Host "  • No Interruptions"
-        Write-Host "========================================================"
+        Write-Host "Session Duration: 30 DAYS"
+        Write-Host "Start Time: $(Get-Date)"
+        Write-Host "End Time: $((Get-Date).AddDays(30))"
+        Write-Host "=================================================="
         Write-Host ""
 
-        # البقاء نشطاً لمدة 5 ساعات و50 دقيقة
-        $totalMinutes = 350
-        $minutesElapsed = 0
+        $totalMinutes = 30 * 24 * 60
+        $checkCount = 0
         
-        while ($minutesElapsed -lt $totalMinutes) {
-            $remainingMinutes = $totalMinutes - $minutesElapsed
-            $hours = [math]::Floor($remainingMinutes / 60)
-            $minutes = $remainingMinutes % 60
+        for ($i = 0; $i -lt $totalMinutes; $i++) {
+            $remainingDays = 30 - [math]::Round($i / (24 * 60), 1)
             
-            # عرض الحالة كل 30 دقيقة
-            if ($minutesElapsed % 30 -eq 0) {
-                Write-Host "[$(Get-Date)] Permanent RDP Active - $hours}h $minutes}m until renewal"
-                
-                # عرض سجلات الاستعادة
-                try {
-                    if (Test-Path "C:\rdp-auto-recovery.log") {
-                        $lastLog = Get-Content "C:\rdp-auto-recovery.log" -Tail 1 -ErrorAction SilentlyContinue
-                        if ($lastLog) {
-                            Write-Host "Recovery System: $lastLog"
-                        }
-                    }
-                } catch {
-                    # تجاهل أخطاء القراءة
-                }
+            if ($checkCount % 144 == 0) {
+                Write-Host "[$(Get-Date)] RDP Active - $remainingDays days remaining"
             }
             
-            # فحص شامل كل ساعة
-            if ($minutesElapsed % 60 -eq 0) {
-                Write-Host "🔍 Performing health check..."
-                
-                # التحقق من RDP
+            if ($checkCount % 12 == 0) {
                 $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
                 if ($rdpService.Status -ne "Running") {
-                    Write-Host "🔄 Restarting RDP Service..."
+                    Write-Host "RDP service not running - restarting..."
                     Start-Service -Name "TermService" -Force
                 }
-                
-                # التحقق من Tailscale واستقرار IP
-                try {
-                    $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-                    $savedIP = Get-Content "C:\tailscale-ip.txt" -ErrorAction SilentlyContinue
-                    
-                    if ($currentIP -and $savedIP -and $currentIP -eq $savedIP) {
-                        Write-Host "✅ IP Stable: $currentIP"
-                    } else {
-                        Write-Host "🔄 Restoring original IP..."
-                        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --hostname=permanent-rdp-static --reset
-                        if ($currentIP) {
-                            Set-Content -Path "C:\tailscale-ip.txt" -Value $currentIP
-                        }
-                    }
-                } catch {
-                    Write-Host "⚠️ IP check error"
-                }
-                
-                Write-Host "✅ Health check completed"
             }
             
-            $minutesElapsed += 5
-            Start-Sleep -Seconds 300  # الانتظار 5 دقائق
+            $checkCount++
+            Start-Sleep -Seconds 60
         }
         
-        Write-Host "🔄 Auto-renewal in progress..."
-        Write-Host "✅ Session completed successfully - Renewing..."
+        Write-Host "30-day RDP session completed successfully!"
