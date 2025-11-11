@@ -115,15 +115,27 @@ jobs:
         for ($i = 0; $i -lt $totalMinutes; $i++) {
             $remainingDays = 30 - [math]::Round($i / (24 * 60), 1)
             
-            if ($checkCount % 144 == 0) {
+            # استخدام -eq بدلاً من ==
+            if ($checkCount % 144 -eq 0) {
                 Write-Host "[$(Get-Date)] RDP Active - $remainingDays days remaining"
             }
             
-            if ($checkCount % 12 == 0) {
+            if ($checkCount % 12 -eq 0) {
                 $rdpService = Get-Service -Name "TermService" -ErrorAction SilentlyContinue
                 if ($rdpService.Status -ne "Running") {
                     Write-Host "RDP service not running - restarting..."
                     Start-Service -Name "TermService" -Force
+                }
+                
+                # التحقق من Tailscale كل ساعة
+                try {
+                    $currentIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+                    if (-not $currentIP) {
+                        Write-Host "Tailscale disconnected - reconnecting..."
+                        & "$env:ProgramFiles\Tailscale\tailscale.exe" up --reset
+                    }
+                } catch {
+                    Write-Host "Tailscale check error"
                 }
             }
             
